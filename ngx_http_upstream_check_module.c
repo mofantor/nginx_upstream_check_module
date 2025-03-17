@@ -1007,9 +1007,11 @@ ngx_http_upstream_check_add_timers(ngx_cycle_t *cycle)
 
         ucscf = peer[i].conf;
         cf = ucscf->check_type_conf;
-				if(is_https_check(&peer[i])){
-					ngx_ssl_create(&ucscf->ssl, NGX_SSL_SSLv3 | NGX_SSL_TLSv1,0);
-				}
+#if (NGX_HTTP_SSL)
+		if(is_https_check(&peer[i])) {
+		    ngx_ssl_create(&ucscf->ssl, NGX_SSL_SSLv3 | NGX_SSL_TLSv1 | NGX_SSL_TLSv1_1 | NGX_SSL_TLSv1_2 | NGX_SSL_TLSv1_3 ,0);
+		}
+#endif
 
         if (cf->need_pool) {
             peer[i].pool = ngx_create_pool(ngx_pagesize, cycle->log);
@@ -1128,7 +1130,12 @@ ngx_http_upstream_check_connect_handler(ngx_event_t *event)
 
     peer = event->data;
     ucscf = peer->conf;
+#if (NGX_HTTP_SSL)
     int is_https_check_type = is_https_check(peer);
+#else
+    int is_https_check_type = 0;
+#endif
+
 
     if (peer->pc.connection != NULL) {
         c = peer->pc.connection;
@@ -1193,12 +1200,11 @@ upstream_check_connect_done:
 #if (NGX_HTTP_SSL)
 
 static void free_SSL_data(ngx_http_upstream_check_peer_t *peer){
-		ngx_connection_t *c = peer->pc.connection;
-    if (is_https_check(peer) &&
-				c->ssl) {
+	ngx_connection_t *c = peer->pc.connection;
+    if (is_https_check(peer) && c->ssl) {
         SSL_free(c->ssl->connection);
         c->ssl = NULL;
-        }
+    }
 }
 
 static void ngx_http_upstream_do_ssl_handshake(ngx_event_t *event) {
@@ -1214,11 +1220,8 @@ static void ngx_http_upstream_do_ssl_handshake(ngx_event_t *event) {
       return;
     }
     int tcp_nodelay = 1;
-    if (setsockopt(c->fd, IPPROTO_TCP, TCP_NODELAY,
-                   (const void *) &tcp_nodelay, sizeof(int)) == -1)
-    {
-        ngx_connection_error(c, ngx_socket_errno,
-                             "setsockopt(TCP_NODELAY) failed");
+    if (setsockopt(c->fd, IPPROTO_TCP, TCP_NODELAY, (const void *) &tcp_nodelay, sizeof(int)) == -1) {
+        ngx_connection_error(c, ngx_socket_errno, "setsockopt(TCP_NODELAY) failed");
         return;
     }
     c->tcp_nodelay = NGX_TCP_NODELAY_SET;
@@ -1245,13 +1248,6 @@ ngx_ups_ssl_handshake(ngx_connection_t *c) {
     peer = c->data;
     if (c->ssl && c->ssl->handshaked) {
       rc = SSL_get_verify_result(c->ssl->connection);
-      if (rc != X509_V_OK) {
-          /*
-          ngx_log_error(NGX_LOG_ERR, c->log, 0,
-                        "upstream SSL certificate verify error: (%l:%s)",
-                        rc, X509_verify_cert_error_string(rc));
-          */
-      }
     }
     peer->state = NGX_HTTP_CHECK_CONNECT_DONE;
     c->write->handler = peer->send_handler;
