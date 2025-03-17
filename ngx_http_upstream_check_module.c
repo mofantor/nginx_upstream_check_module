@@ -238,7 +238,7 @@ struct ngx_http_upstream_check_srv_conf_s {
 
     ngx_uint_t                               default_down;
 #if (NGX_HTTP_SSL)
-    ngx_ssl_t                       ssl;
+    ngx_ssl_t                                ssl;
 #endif
 };
 
