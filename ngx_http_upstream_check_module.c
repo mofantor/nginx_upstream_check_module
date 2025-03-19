@@ -1200,7 +1200,12 @@ upstream_check_connect_done:
 #if (NGX_HTTP_SSL)
 
 static void free_SSL_data(ngx_http_upstream_check_peer_t *peer){
+
+    if(!peer) { return; }
+
 	ngx_connection_t *c = peer->pc.connection;
+    if(!c) { return; }
+
     if (is_https_check(peer) && c->ssl) {
         SSL_free(c->ssl->connection);
         c->ssl = NULL;
@@ -3655,6 +3660,8 @@ ngx_http_upstream_check_init_main_conf(ngx_conf_t *cf, void *conf)
     ngx_uint_t                      i;
     ngx_http_upstream_srv_conf_t  **uscfp;
     ngx_http_upstream_main_conf_t  *umcf;
+    ngx_uint_t                      j;
+    ngx_http_upstream_server_t *upset;
 
     umcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_module);
 
@@ -3675,6 +3682,11 @@ ngx_http_upstream_check_init_main_conf(ngx_conf_t *cf, void *conf)
 
         if (ngx_http_upstream_check_init_srv_conf(cf, uscfp[i]) != NGX_OK) {
             return NGX_CONF_ERROR;
+        }
+
+        upset = uscfp[i]->servers->elts;
+        for (j = 0; j < uscfp[i]->servers->nelts; j++) {
+            ngx_http_upstream_check_add_peer(cf,uscfp[i], upset[j].addrs);
         }
     }
 
