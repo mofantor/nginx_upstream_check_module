@@ -1047,10 +1047,9 @@ ngx_http_upstream_check_begin_handler(ngx_event_t *event)
     ngx_add_timer(event, ucscf->check_interval / 2);
 
     /* This process is processing this peer now. */
-    if ((peer->shm->owner == ngx_pid  ||
-        (peer->pc.connection != NULL) ||
-        peer->check_timeout_ev.timer_set)) {
-        return;
+    if (peer->shm->owner == ngx_pid  ||
+        (peer->pc.connection != NULL && peer->check_timeout_ev.timer_set)) {
+            return;
     }
 
     interval = ngx_current_msec - peer->shm->access_time;
