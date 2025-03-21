@@ -1174,7 +1174,7 @@ ngx_http_upstream_check_connect_handler(ngx_event_t *event)
     c->sendfile = 0;
     c->read->log = c->log;
     c->write->log = c->log;
-    c->pool = ngx_create_pool(NGX_CYCLE_POOL_SIZE, ngx_cycle->log);
+    c->pool = peer->pool;
 #if (NGX_HTTP_SSL)
     if (is_https_check_type && rc == NGX_AGAIN) {
         c->write->handler = ngx_http_upstream_do_ssl_handshake;
@@ -2664,10 +2664,6 @@ ngx_http_upstream_check_clean_event(ngx_http_upstream_check_peer_t *peer)
         } else {
             ngx_close_connection(c);
             peer->pc.connection = NULL;
-            if (c->pool) {
-               ngx_destroy_pool(c->pool);
-               c->pool=NULL;
-            }
         }
     }
 
@@ -3660,8 +3656,6 @@ ngx_http_upstream_check_init_main_conf(ngx_conf_t *cf, void *conf)
     ngx_uint_t                      i;
     ngx_http_upstream_srv_conf_t  **uscfp;
     ngx_http_upstream_main_conf_t  *umcf;
-    ngx_uint_t                      j;
-    ngx_http_upstream_server_t *upset;
 
     umcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_module);
 
@@ -3682,11 +3676,6 @@ ngx_http_upstream_check_init_main_conf(ngx_conf_t *cf, void *conf)
 
         if (ngx_http_upstream_check_init_srv_conf(cf, uscfp[i]) != NGX_OK) {
             return NGX_CONF_ERROR;
-        }
-
-        upset = uscfp[i]->servers->elts;
-        for (j = 0; j < uscfp[i]->servers->nelts; j++) {
-            ngx_http_upstream_check_add_peer(cf,uscfp[i], upset[j].addrs);
         }
     }
 
