@@ -257,7 +257,7 @@ sudo make install
 | 1.16.1+ | check_1.16.1+.patch |
 | 1.20.1+ | check_1.20.1+.patch |
 | 1.26.3+ | check_1.26.3+.patch |
-
+| 1.28.1+ | check_1.28.1+.patch |
 
 
 ## Authors
