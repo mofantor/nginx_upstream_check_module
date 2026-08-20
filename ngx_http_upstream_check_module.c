@@ -3172,6 +3172,12 @@ ngx_http_upstream_check_status_html_format(ngx_buf_t *b,
 
     for (i = 0; i < peers->peers.nelts; i++) {
 
+        if (peer[i].is_resolve_pool
+            && ngx_atomic_fetch_add(&peer[i].shm->available, 0))
+        {
+            continue;
+        }
+
         if (flag & NGX_CHECK_STATUS_DOWN) {
 
             if (!peer[i].shm->down) {
@@ -3213,6 +3219,12 @@ ngx_http_upstream_check_status_html_format(ngx_buf_t *b,
             count, ngx_http_upstream_check_shm_generation);
 
     for (i = 0; i < peers->peers.nelts; i++) {
+
+        if (peer[i].is_resolve_pool
+            && ngx_atomic_fetch_add(&peer[i].shm->available, 0))
+        {
+            continue;
+        }
 
         if (flag & NGX_CHECK_STATUS_DOWN) {
 
@@ -3266,6 +3278,12 @@ ngx_http_upstream_check_status_csv_format(ngx_buf_t *b,
     peer = peers->peers.elts;
     for (i = 0; i < peers->peers.nelts; i++) {
 
+        if (peer[i].is_resolve_pool
+            && ngx_atomic_fetch_add(&peer[i].shm->available, 0))
+        {
+            continue;
+        }
+
         if (flag & NGX_CHECK_STATUS_DOWN) {
 
             if (!peer[i].shm->down) {
@@ -3306,6 +3324,12 @@ ngx_http_upstream_check_status_json_format(ngx_buf_t *b,
 
     for (i = 0; i < peers->peers.nelts; i++) {
 
+        if (peer[i].is_resolve_pool
+            && ngx_atomic_fetch_add(&peer[i].shm->available, 0))
+        {
+            continue;
+        }
+
         if (flag & NGX_CHECK_STATUS_DOWN) {
 
             if (!peer[i].shm->down) {
@@ -3330,8 +3354,14 @@ ngx_http_upstream_check_status_json_format(ngx_buf_t *b,
             count,
             ngx_http_upstream_check_shm_generation);
 
-    last = peers->peers.nelts - 1;
+    last = 0;
     for (i = 0; i < peers->peers.nelts; i++) {
+
+        if (peer[i].is_resolve_pool
+            && ngx_atomic_fetch_add(&peer[i].shm->available, 0))
+        {
+            continue;
+        }
 
         if (flag & NGX_CHECK_STATUS_DOWN) {
 
@@ -3364,7 +3394,7 @@ ngx_http_upstream_check_status_json_format(ngx_buf_t *b,
                 peer[i].shm->fall_count,
                 &peer[i].conf->check_type_conf->name,
                 peer[i].conf->port,
-                (i == last) ? "" : ",");
+                (++last == count) ? "" : ",");
     }
 
     b->last = ngx_snprintf(b->last, b->end - b->last,
@@ -4252,6 +4282,16 @@ ngx_http_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
         peer_shm->owner = NGX_INVALID_PID;
 
         if (same) {
+            /*
+             * On reload the shm zone is reused.  Pool slots that were
+             * claimed (available=0) by a peer in the old worker cycle
+             * must be released so new workers can claim them again.
+             * Use CAS so an already-free slot (available=1) is not
+             * double-incremented.
+             */
+            if (peer[i].is_resolve_pool) {
+                ngx_atomic_cmp_set(&peer_shm->available, 0, 1);
+            }
             continue;
         }
 
@@ -4277,13 +4317,13 @@ ngx_http_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
                    peer_shm->socklen);
 
         /*
-         * V2: mark non-primary resolve pool slots as available (free).  The
-         * primary slot (resolve_pool_first == NGX_ERROR) starts in-use since
-         * it is immediately assigned to the template peer in peers->resolve.
+         * V2: all resolve pool slots (primary and secondary) start available
+         * (free).  The primary slot is claimed by get_resolve_peer when the
+         * first DNS address arrives, same as secondary slots.  begin_handler
+         * checks available != 0 and skips unclaimed slots, preventing phantom
+         * probes against the config-load-time placeholder address.
          */
-        if (peer[i].is_resolve_pool
-            && peer[i].resolve_pool_first != (ngx_uint_t) NGX_ERROR)
-        {
+        if (peer[i].is_resolve_pool) {
             ngx_atomic_cmp_set(&peer_shm->available, 0, 1);
 
             ucscf = peer[i].conf;
