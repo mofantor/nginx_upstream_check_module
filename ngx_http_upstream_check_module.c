@@ -4282,6 +4282,16 @@ ngx_http_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
         peer_shm->owner = NGX_INVALID_PID;
 
         if (same) {
+            /*
+             * On reload the shm zone is reused.  Pool slots that were
+             * claimed (available=0) by a peer in the old worker cycle
+             * must be released so new workers can claim them again.
+             * Use CAS so an already-free slot (available=1) is not
+             * double-incremented.
+             */
+            if (peer[i].is_resolve_pool) {
+                ngx_atomic_cmp_set(&peer_shm->available, 0, 1);
+            }
             continue;
         }
 
