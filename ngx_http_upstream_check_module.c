@@ -155,6 +155,15 @@ struct ngx_http_upstream_check_peer_s {
     ngx_flag_t                               is_resolve_pool;
     ngx_uint_t                               resolve_pool_first; /* NGX_ERROR = I am the first */
     ngx_uint_t                               resolve_pool_size;  /* valid only on first slot */
+
+    /*
+     * Deferred claim support for the config-cycle preresolve path, which
+     * runs in the master before this module's shm zone is initialized.
+     * pending_claim marks a slot claimed at the config-peer level;
+     * init_shm_zone consumes it when seeding the new shm zone.
+     */
+    ngx_flag_t                               pending_claim;
+    ngx_uint_t                               resolve_pending_n;  /* valid only on first slot */
 };
 
 
@@ -992,7 +1001,7 @@ ngx_uint_t
 ngx_http_upstream_check_get_resolve_peer(ngx_uint_t first_index,
     struct sockaddr *sa, socklen_t socklen, ngx_str_t *name)
 {
-    ngx_uint_t                             i, pool_size;
+    ngx_uint_t                             i, n, pool_size;
     ngx_http_upstream_check_peer_t        *peer;
     ngx_http_upstream_check_peer_shm_t    *peer_shm;
     static ngx_str_t                       unknown = ngx_string("(unknown)");
@@ -1027,6 +1036,54 @@ ngx_http_upstream_check_get_resolve_peer(ngx_uint_t first_index,
     }
 
     pool_size = peer[first_index].resolve_pool_size;
+
+    if (check_peers_ctx->peers_shm == NULL) {
+
+        /*
+         * Config-cycle context.  On reload, the upstream zone module
+         * preresolves the peers carried over from the previous cycle during
+         * ngx_init_cycle, in the master process.  The check shm zone is
+         * added after the upstream zones (init_main_conf vs config parse),
+         * so it always initializes after them: peers_shm does not exist yet
+         * and peer[].shm (wired per worker in add_timers) is NULL, meaning
+         * no slot can be claimed through shared memory here.
+         *
+         * Claim at the config-peer level instead: take the next unclaimed
+         * slot, record the probe address in its config-time
+         * sockaddr_storage buffer, and mark it pending.  init_shm_zone
+         * consumes the flag and seeds the slot as in-use; add_timers arms
+         * its probe timer.  This path runs single-threaded in the master,
+         * pre-fork, so every worker inherits the updated peer state.
+         */
+        n = peer[first_index].resolve_pending_n;
+
+        if (n >= pool_size) {
+            ngx_log_error(NGX_LOG_WARN, ngx_cycle->log, 0,
+                          "check resolve pool exhausted at preresolve "
+                          "(first=%ui size=%ui): peer \"%V\" has no "
+                          "independent health-check slot",
+                          first_index, pool_size, safe_name);
+            return NGX_ERROR;
+        }
+
+        i = first_index + n;
+        peer[first_index].resolve_pending_n = n + 1;
+
+        ngx_memcpy(peer[i].check_peer_addr->sockaddr, sa, socklen);
+        peer[i].check_peer_addr->socklen = socklen;
+        if (name) {
+            peer[i].check_peer_addr->name = *name;
+        }
+
+        peer[i].pending_claim = 1;
+
+        ngx_log_debug3(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
+                       "check resolve peer claim deferred: slot %ui for "
+                       "\"%V\" (pool first=%ui)",
+                       i, safe_name, first_index);
+
+        return i;
+    }
 
     for (i = first_index; i < first_index + pool_size; i++) {
         peer_shm = peer[i].shm;
@@ -1305,12 +1362,15 @@ ngx_http_upstream_check_add_timers(ngx_cycle_t *cycle)
         peer[i].reinit = cf->reinit;
 
         /*
-         * V2: non-primary resolve pool slots start in the free pool (available
-         * = 1).  Their check timers are armed by get_resolve_peer when a DNS
-         * resolver claims them.  Skip timer setup here.
+         * V2: free resolve pool slots have no probe address yet; their
+         * check timers are armed by get_resolve_peer when a DNS resolver
+         * claims them at runtime.  Slots already in use — seeded from a
+         * deferred preresolve claim in init_shm_zone — must be armed here
+         * like any static peer, in every worker, or nothing would ever
+         * probe them.
          */
         if (peer[i].is_resolve_pool
-            && peer[i].resolve_pool_first != (ngx_uint_t) NGX_ERROR)
+            && ngx_atomic_fetch_add(&peer[i].shm->available, 0))
         {
             continue;
         }
@@ -1442,6 +1502,22 @@ ngx_http_upstream_check_connect_handler(ngx_event_t *event)
         }
     }
     ngx_memzero(&peer->pc, sizeof(ngx_peer_connection_t));
+
+    /*
+     * V2: a resolve pool slot's probe address lives in shared memory and is
+     * updated by whichever process claims the slot.  The per-process
+     * check_peer_addr copy can be stale in every other worker (each one
+     * inherits the config-time placeholder at fork), and the probing owner
+     * is elected independently of the claimer.  Refresh from shm before
+     * connecting so any elected owner probes the current address.
+     */
+    if (peer->is_resolve_pool && peer->shm != NULL) {
+        ngx_shmtx_lock(&peer->shm->mutex);
+        peer->check_peer_addr->socklen = peer->shm->socklen;
+        ngx_memcpy(peer->check_peer_addr->sockaddr, peer->shm->sockaddr,
+                   peer->shm->socklen);
+        ngx_shmtx_unlock(&peer->shm->mutex);
+    }
 
     peer->pc.sockaddr = peer->check_peer_addr->sockaddr;
     peer->pc.socklen = peer->check_peer_addr->socklen;
@@ -4283,14 +4359,28 @@ ngx_http_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
 
         if (same) {
             /*
-             * On reload the shm zone is reused.  Pool slots that were
-             * claimed (available=0) by a peer in the old worker cycle
-             * must be released so new workers can claim them again.
-             * Use CAS so an already-free slot (available=1) is not
-             * double-incremented.
+             * The shm zone is reused (binary upgrade with an unchanged
+             * peer set).  Pool slots claimed (available=0) by the old
+             * cycle must be released so the new cycle can claim them
+             * again — except slots the preresolve path already claimed
+             * for this cycle (pending_claim): seed their probe address
+             * and keep them in use.  The old cycle's workers may still
+             * be probing, so write under the slot mutex.
              */
             if (peer[i].is_resolve_pool) {
-                ngx_atomic_cmp_set(&peer_shm->available, 0, 1);
+                if (peer[i].pending_claim) {
+                    ngx_shmtx_lock(&peer_shm->mutex);
+                    peer_shm->socklen = peer[i].check_peer_addr->socklen;
+                    ngx_memcpy(peer_shm->sockaddr,
+                               peer[i].check_peer_addr->sockaddr,
+                               peer_shm->socklen);
+                    ngx_shmtx_unlock(&peer_shm->mutex);
+
+                    ngx_atomic_cmp_set(&peer_shm->available, 1, 0);
+
+                } else {
+                    ngx_atomic_cmp_set(&peer_shm->available, 0, 1);
+                }
             }
             continue;
         }
@@ -4322,8 +4412,44 @@ ngx_http_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
          * first DNS address arrives, same as secondary slots.  begin_handler
          * checks available != 0 and skips unclaimed slots, preventing phantom
          * probes against the config-load-time placeholder address.
+         *
+         * Slots the preresolve path claimed before this zone existed
+         * (pending_claim) are seeded from the deferred claim instead and
+         * stay in use (available stays 0 in the fresh zeroed zone).  Their
+         * health state is inherited from the previous generation by
+         * address, so a reload does not reset rise/fall/down.
          */
         if (peer[i].is_resolve_pool) {
+
+            if (peer[i].pending_claim) {
+
+                peer_shm->socklen = peer[i].check_peer_addr->socklen;
+                ngx_memcpy(peer_shm->sockaddr,
+                           peer[i].check_peer_addr->sockaddr,
+                           peer_shm->socklen);
+
+                opeer_shm = NULL;
+                if (opeers_shm) {
+                    opeer_shm = ngx_http_upstream_check_find_shm_peer(
+                                    opeers_shm, peer[i].check_peer_addr);
+                }
+
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, shm_zone->shm.log, 0,
+                               "check resolve pool slot %ui seeded from "
+                               "deferred claim \"%V\"",
+                               i, &peer[i].check_peer_addr->name);
+
+                ucscf = peer[i].conf;
+                rc = ngx_http_upstream_check_init_shm_peer(peer_shm, opeer_shm,
+                         ucscf->default_down, pool,
+                         &peer[i].check_peer_addr->name);
+                if (rc != NGX_OK) {
+                    return NGX_ERROR;
+                }
+
+                continue;
+            }
+
             ngx_atomic_cmp_set(&peer_shm->available, 0, 1);
 
             ucscf = peer[i].conf;
