@@ -233,6 +233,11 @@ Directives
     connection, the default vaule 1 indicates that nginx will certainly
     close the connection after a request.
 
+    note: Values above 1 do not currently send more than one request per
+    connection: a check parks its connection when it finishes and the next
+    check closes that connection before connecting again.  *type=http* and
+    *type=https* behave the same way.
+
   check_fastcgi_param
     Syntax: *check_fastcgi_params parameter value*
 

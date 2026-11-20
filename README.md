@@ -241,6 +241,13 @@ Add the support of health check with the upstream servers.
 
 + ​Description:
 > Number of requests sent per keepalive connection.
+
++ Note:
+> Values above 1 do not currently send more than one request per connection.
+> A check parks its connection when it finishes, and the next check closes
+> that connection before connecting again.  `type=http` and `type=https`
+> behave the same way; the default of 1 is unaffected.
+
 ### check_fastcgi_param
 + ​Syntax:
 > check_fastcgi_params parameter value
