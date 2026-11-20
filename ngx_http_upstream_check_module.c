@@ -140,6 +140,9 @@ struct ngx_http_upstream_check_peer_s {
     ngx_event_t                              check_timeout_ev;
     ngx_peer_connection_t                    pc;
 
+    /* TLS objects of one check connection, destroyed when it is closed */
+    ngx_pool_t                              *conn_pool;
+
     void                                    *check_data;
     ngx_event_handler_pt                     send_handler;
     ngx_event_handler_pt                     recv_handler;
@@ -172,6 +175,7 @@ typedef struct {
 #define NGX_HTTP_CHECK_SSL_HELLO             0x0004
 #define NGX_HTTP_CHECK_MYSQL                 0x0008
 #define NGX_HTTP_CHECK_AJP                   0x0010
+#define NGX_HTTP_CHECK_HTTPS                 0x0020
 
 #define NGX_CHECK_HTTP_2XX                   0x0002
 #define NGX_CHECK_HTTP_3XX                   0x0004
@@ -198,6 +202,7 @@ typedef struct {
 
     unsigned need_pool;
     unsigned need_keepalive;
+    unsigned need_ssl;
 } ngx_check_conf_t;
 
 
@@ -251,6 +256,20 @@ struct ngx_http_upstream_check_srv_conf_s {
         ngx_uint_t                           return_code;
         ngx_uint_t                           status_alive;
     } code;
+
+#if (NGX_SSL)
+    /* check type=https; left NULL when the upstream is not checked over TLS */
+    ngx_ssl_t                               *ssl;
+    ngx_flag_t                               ssl_verify;
+    /* SNI and the name the peer certificate is matched against */
+    ngx_str_t                                ssl_name;
+    ngx_str_t                                ssl_trusted_certificate;
+    /* mTLS: the client certificate offered to the backend, its key and the
+     * passphrases for an encrypted key */
+    ngx_str_t                                ssl_certificate;
+    ngx_str_t                                ssl_certificate_key;
+    ngx_array_t                             *ssl_passwords;
+#endif
 
     ngx_array_t                             *fastcgi_params;
 
@@ -396,6 +415,19 @@ static ngx_int_t ngx_http_upstream_check_ssl_hello_parse(
 static void ngx_http_upstream_check_ssl_hello_reinit(
     ngx_http_upstream_check_peer_t *peer);
 
+#if (NGX_SSL)
+static ngx_int_t ngx_http_upstream_check_ssl_connect(
+    ngx_http_upstream_check_peer_t *peer, ngx_connection_t *c);
+static ngx_int_t ngx_http_upstream_check_ssl_ready(
+    ngx_http_upstream_check_peer_t *peer, ngx_connection_t *c);
+static void ngx_http_upstream_check_ssl_handshake(ngx_connection_t *c);
+static void ngx_http_upstream_check_ssl_close(ngx_connection_t *c);
+static int ngx_http_upstream_check_ssl_verify_callback(int ok,
+    X509_STORE_CTX *store);
+static ngx_int_t ngx_http_upstream_check_init_ssl(ngx_conf_t *cf,
+    ngx_http_upstream_check_srv_conf_t *ucscf);
+#endif
+
 static ngx_int_t ngx_http_upstream_check_mysql_init(
     ngx_http_upstream_check_peer_t *peer);
 static ngx_int_t ngx_http_upstream_check_mysql_parse(
@@ -456,6 +488,19 @@ static char *ngx_http_upstream_check_http_expect_alive(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 
 static char *ngx_http_upstream_check_fastcgi_params(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+
+static char *ngx_http_upstream_check_https_sni(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_http_upstream_check_https_verify(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_http_upstream_check_https_trusted_certificate(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_http_upstream_check_https_certificate(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_http_upstream_check_https_certificate_key(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_http_upstream_check_https_password_file(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 
 static char *ngx_http_upstream_check_shm_size(ngx_conf_t *cf,
@@ -539,6 +584,48 @@ static ngx_command_t  ngx_http_upstream_check_commands[] = {
     { ngx_string("check_http_expect_alive"),
       NGX_HTTP_UPS_CONF|NGX_CONF_1MORE,
       ngx_http_upstream_check_http_expect_alive,
+      0,
+      0,
+      NULL },
+
+    { ngx_string("check_https_sni"),
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
+      ngx_http_upstream_check_https_sni,
+      0,
+      0,
+      NULL },
+
+    { ngx_string("check_https_verify"),
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
+      ngx_http_upstream_check_https_verify,
+      0,
+      0,
+      NULL },
+
+    { ngx_string("check_https_trusted_certificate"),
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
+      ngx_http_upstream_check_https_trusted_certificate,
+      0,
+      0,
+      NULL },
+
+    { ngx_string("check_https_certificate"),
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
+      ngx_http_upstream_check_https_certificate,
+      0,
+      0,
+      NULL },
+
+    { ngx_string("check_https_certificate_key"),
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
+      ngx_http_upstream_check_https_certificate_key,
+      0,
+      0,
+      NULL },
+
+    { ngx_string("check_https_password_file"),
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
+      ngx_http_upstream_check_https_password_file,
       0,
       0,
       NULL },
@@ -670,6 +757,12 @@ static char ngx_ajp_cpong_packet[] = {
 };
 
 
+/*
+ * The entries are initialized by position:
+ *   type, name, default_send, default_status_alive,
+ *   send_handler, recv_handler, init, parse, reinit,
+ *   need_pool, need_keepalive, need_ssl
+ */
 static ngx_check_conf_t  ngx_check_types[] = {
 
     { NGX_HTTP_CHECK_TCP,
@@ -682,7 +775,8 @@ static ngx_check_conf_t  ngx_check_types[] = {
       NULL,
       NULL,
       0,
-      1 },
+      1,
+      0 },
 
     { NGX_HTTP_CHECK_HTTP,
       ngx_string("http"),
@@ -693,6 +787,20 @@ static ngx_check_conf_t  ngx_check_types[] = {
       ngx_http_upstream_check_http_init,
       ngx_http_upstream_check_http_parse,
       ngx_http_upstream_check_http_reinit,
+      1,
+      1,
+      0 },
+
+    { NGX_HTTP_CHECK_HTTPS,
+      ngx_string("https"),
+      ngx_string("GET / HTTP/1.0\r\n\r\n"),
+      NGX_CONF_BITMASK_SET | NGX_CHECK_HTTP_2XX | NGX_CHECK_HTTP_3XX,
+      ngx_http_upstream_check_send_handler,
+      ngx_http_upstream_check_recv_handler,
+      ngx_http_upstream_check_http_init,
+      ngx_http_upstream_check_http_parse,
+      ngx_http_upstream_check_http_reinit,
+      1,
       1,
       1 },
 
@@ -706,6 +814,7 @@ static ngx_check_conf_t  ngx_check_types[] = {
       ngx_http_upstream_check_fastcgi_parse,
       ngx_http_upstream_check_http_reinit,
       1,
+      0,
       0 },
 
     { NGX_HTTP_CHECK_SSL_HELLO,
@@ -718,6 +827,7 @@ static ngx_check_conf_t  ngx_check_types[] = {
       ngx_http_upstream_check_ssl_hello_parse,
       ngx_http_upstream_check_ssl_hello_reinit,
       1,
+      0,
       0 },
 
     { NGX_HTTP_CHECK_MYSQL,
@@ -730,6 +840,7 @@ static ngx_check_conf_t  ngx_check_types[] = {
       ngx_http_upstream_check_mysql_parse,
       ngx_http_upstream_check_mysql_reinit,
       1,
+      0,
       0 },
 
     { NGX_HTTP_CHECK_AJP,
@@ -742,6 +853,7 @@ static ngx_check_conf_t  ngx_check_types[] = {
       ngx_http_upstream_check_ajp_parse,
       ngx_http_upstream_check_ajp_reinit,
       1,
+      0,
       0 },
 
     { 0,
@@ -753,6 +865,7 @@ static ngx_check_conf_t  ngx_check_types[] = {
       NULL,
       NULL,
       NULL,
+      0,
       0,
       0 }
 };
@@ -1437,6 +1550,9 @@ ngx_http_upstream_check_connect_handler(ngx_event_t *event)
         if ((rc = ngx_http_upstream_check_peek_one_byte(c)) == NGX_OK) {
             goto upstream_check_connect_done;
         } else {
+#if (NGX_SSL)
+            ngx_http_upstream_check_ssl_close(c);
+#endif
             ngx_close_connection(c);
             peer->pc.connection = NULL;
         }
@@ -1473,6 +1589,25 @@ ngx_http_upstream_check_connect_handler(ngx_event_t *event)
 
 upstream_check_connect_done:
     peer->state = NGX_HTTP_CHECK_CONNECT_DONE;
+
+#if (NGX_SSL)
+    /*
+     * A TLS check runs the handshake first.  It installs the send and the
+     * recv handlers itself, once the handshake is through.  c->ssl is already
+     * set when a kept alive check connection is reused.
+     */
+    if (ucscf->check_type_conf->need_ssl && c->ssl == NULL) {
+        if (ngx_http_upstream_check_ssl_connect(peer, c) != NGX_OK) {
+            /* the connection is not usable, the clean event must close it */
+            c->error = 1;
+
+            ngx_http_upstream_check_status_update(peer, 0);
+            ngx_http_upstream_check_clean_event(peer);
+        }
+
+        return;
+    }
+#endif
 
     c->write->handler = peer->send_handler;
     c->read->handler = peer->recv_handler;
@@ -1667,6 +1802,16 @@ ngx_http_upstream_check_send_handler(ngx_event_t *event)
         if (size > 0) {
             ctx->send.pos += size;
         } else if (size == 0 || size == NGX_AGAIN) {
+#if (NGX_SSL)
+            /*
+             * ngx_ssl_write() can take the data into its own buffer and
+             * return without the fd being ready, so the write event has to
+             * be re-armed explicitly here.
+             */
+            if (c->ssl && ngx_handle_write_event(c->write, 0) != NGX_OK) {
+                goto check_send_fail;
+            }
+#endif
             return;
         } else {
             c->error = 1;
@@ -1718,7 +1863,7 @@ ngx_http_upstream_check_recv_handler(ngx_event_t *event)
 
     if (ctx->recv.start == NULL) {
         /* 1/2 of the page_size, is it enough? */
-        ctx->recv.start = ngx_palloc(c->pool, ngx_pagesize / 2);
+        ctx->recv.start = ngx_palloc(peer->pool, ngx_pagesize / 2);
         if (ctx->recv.start == NULL) {
             goto check_recv_fail;
         }
@@ -1733,7 +1878,7 @@ ngx_http_upstream_check_recv_handler(ngx_event_t *event)
         /* buffer not big enough? enlarge it by twice */
         if (n == 0) {
             size = ctx->recv.end - ctx->recv.start;
-            new_buf = ngx_palloc(c->pool, size * 2);
+            new_buf = ngx_palloc(peer->pool, size * 2);
             if (new_buf == NULL) {
                 goto check_recv_fail;
             }
@@ -2697,6 +2842,297 @@ ngx_http_upstream_check_ssl_hello_reinit(ngx_http_upstream_check_peer_t *peer)
 }
 
 
+#if (NGX_SSL)
+
+/*
+ * check type=https.
+ *
+ * Unlike ssl_hello, which only throws a hand-built ClientHello at the port,
+ * this runs a real TLS connection and then the plain HTTP check over it.
+ * The HTTP parsing, the expected status codes and the keep alive handling
+ * are all shared with type=http; only the connection gets a handshake in
+ * front of it.
+ */
+
+static int
+ngx_http_upstream_check_ssl_verify_callback(int ok, X509_STORE_CTX *store)
+{
+    /*
+     * Failures are reported once, with the peer address in the message,
+     * through SSL_get_verify_result() after the handshake.  Returning 1
+     * keeps OpenSSL from aborting the handshake on its own.
+     */
+    return 1;
+}
+
+
+/* Called once the peer is a usable TLS connection: verify, then send. */
+static ngx_int_t
+ngx_http_upstream_check_ssl_ready(ngx_http_upstream_check_peer_t *peer,
+    ngx_connection_t *c)
+{
+    long                                rc;
+    ngx_http_upstream_check_srv_conf_t *ucscf;
+
+    ucscf = peer->conf;
+
+    if (!c->ssl->handshaked) {
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                      "https handshake error with peer: %V",
+                      &peer->check_peer_addr->name);
+        return NGX_ERROR;
+    }
+
+    if (ucscf->ssl_verify) {
+
+        rc = SSL_get_verify_result(c->ssl->connection);
+
+        if (rc != X509_V_OK) {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "https SSL certificate verify error with peer: %V "
+                          "(%l:%s)", &peer->check_peer_addr->name, rc,
+                          X509_verify_cert_error_string(rc));
+            return NGX_ERROR;
+        }
+
+        if (ngx_ssl_check_host(c, &ucscf->ssl_name) != NGX_OK) {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "https SSL certificate does not match \"%V\" "
+                          "with peer: %V", &ucscf->ssl_name,
+                          &peer->check_peer_addr->name);
+            return NGX_ERROR;
+        }
+    }
+
+    c->write->handler = peer->send_handler;
+    c->read->handler = peer->recv_handler;
+
+    /* the kqueue loop interface needs the write path started explicitly */
+    peer->send_handler(c->write);
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_http_upstream_check_ssl_handshake(ngx_connection_t *c)
+{
+    ngx_http_upstream_check_peer_t  *peer;
+
+    peer = c->data;
+
+    /* The check is over already, the timeout event is the usual reason. */
+    if (peer->pc.connection != c || peer->state == NGX_HTTP_CHECK_ALL_DONE) {
+        return;
+    }
+
+    if (ngx_http_upstream_check_ssl_ready(peer, c) != NGX_OK) {
+        /* the connection is not usable, the clean event must close it */
+        c->error = 1;
+
+        ngx_http_upstream_check_status_update(peer, 0);
+        ngx_http_upstream_check_clean_event(peer);
+    }
+}
+
+
+static ngx_int_t
+ngx_http_upstream_check_ssl_connect(ngx_http_upstream_check_peer_t *peer,
+    ngx_connection_t *c)
+{
+    ngx_http_upstream_check_srv_conf_t  *ucscf;
+
+    ucscf = peer->conf;
+
+    if (ucscf->ssl == NULL) {
+        return NGX_ERROR;
+    }
+
+    /*
+     * The SSL object, its record buffer and the ngx_ssl_connection_t all
+     * come out of c->pool.  peer->pool lives as long as the worker does, so
+     * TLS would grow it by a few kilobytes on every single check.  TLS gets
+     * a pool of its own instead, freed in the clean event.  The check
+     * context and its recv buffer stay in peer->pool, they are reused.
+     */
+    peer->conn_pool = ngx_create_pool(1024, c->log);
+    if (peer->conn_pool == NULL) {
+        return NGX_ERROR;
+    }
+
+    c->pool = peer->conn_pool;
+
+    if (ngx_ssl_create_connection(ucscf->ssl, c,
+                                  NGX_SSL_BUFFER | NGX_SSL_CLIENT)
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    if (ucscf->ssl_name.len) {
+        /* the name is kept NUL-terminated by the directive handler */
+        if (SSL_set_tlsext_host_name(c->ssl->connection,
+                                     ucscf->ssl_name.data)
+            == 0)
+        {
+            ngx_ssl_error(NGX_LOG_WARN, c->log, 0,
+                          "check https: SSL_set_tlsext_host_name(\"%V\") "
+                          "failed", &ucscf->ssl_name);
+            /* no SNI is not fatal, the check can still go through */
+        }
+    }
+
+    /* the handshake itself is covered by the ordinary check timeout */
+    ngx_add_timer(&peer->check_timeout_ev, ucscf->check_timeout);
+
+    if (ngx_ssl_handshake(c) == NGX_AGAIN) {
+        c->ssl->handler = ngx_http_upstream_check_ssl_handshake;
+        return NGX_OK;
+    }
+
+    return ngx_http_upstream_check_ssl_ready(peer, c);
+}
+
+
+/* Does nothing for a check type that never got as far as TLS. */
+static void
+ngx_http_upstream_check_ssl_close(ngx_connection_t *c)
+{
+    ngx_http_upstream_check_peer_t  *peer;
+
+    peer = c->data;
+
+    if (c->ssl != NULL) {
+        /* a health check does not wait for a close_notify round trip */
+        c->ssl->no_wait_shutdown = 1;
+        c->ssl->no_send_shutdown = 1;
+
+        (void) ngx_ssl_shutdown(c);
+    }
+
+    if (peer->conn_pool != NULL) {
+        ngx_destroy_pool(peer->conn_pool);
+        peer->conn_pool = NULL;
+    }
+}
+
+
+static ngx_int_t
+ngx_http_upstream_check_init_ssl(ngx_conf_t *cf,
+    ngx_http_upstream_check_srv_conf_t *ucscf)
+{
+    u_char              *p, *last;
+    ngx_ssl_t           *ssl;
+    ngx_pool_cleanup_t  *cln;
+
+    ssl = ngx_pcalloc(cf->pool, sizeof(ngx_ssl_t));
+    if (ssl == NULL) {
+        return NGX_ERROR;
+    }
+
+    ssl->log = cf->log;
+
+    if (ngx_ssl_create(ssl, NGX_SSL_TLSv1_2 | NGX_SSL_TLSv1_3, NULL) != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    /* the SSL_CTX outlives the configuration, so it has to be freed with it */
+    cln = ngx_pool_cleanup_add(cf->pool, 0);
+    if (cln == NULL) {
+        ngx_ssl_cleanup_ctx(ssl);
+        return NGX_ERROR;
+    }
+
+    cln->handler = ngx_ssl_cleanup_ctx;
+    cln->data = ssl;
+
+    /* a check request and its response both fit in a few kilobytes */
+    ssl->buffer_size = 4096;
+
+    if (ucscf->ssl_name.len) {
+        /* SSL_set_tlsext_host_name() wants a NUL-terminated string */
+        p = ngx_pnalloc(cf->pool, ucscf->ssl_name.len + 1);
+        if (p == NULL) {
+            return NGX_ERROR;
+        }
+
+        last = ngx_cpymem(p, ucscf->ssl_name.data, ucscf->ssl_name.len);
+        *last = '\0';
+
+        ucscf->ssl_name.data = p;
+    }
+
+    if (ucscf->ssl_certificate.len) {
+
+        if (ucscf->ssl_certificate_key.len == 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "no \"check_https_certificate_key\" is defined "
+                               "for certificate \"%V\"",
+                               &ucscf->ssl_certificate);
+            return NGX_ERROR;
+        }
+
+        /*
+         * The key is read once, here, and stays inside the SSL_CTX: a check
+         * connection inherits it through ngx_ssl_create_connection().  The
+         * passphrases come from the temporary configuration pool and are
+         * zeroed when it goes away, which is fine because they are only
+         * needed to read the key now.
+         */
+        if (ngx_ssl_certificate(cf, ssl, &ucscf->ssl_certificate,
+                                &ucscf->ssl_certificate_key,
+                                ucscf->ssl_passwords)
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+
+    } else if (ucscf->ssl_certificate_key.len) {
+
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "\"check_https_certificate_key\" requires "
+                           "\"check_https_certificate\" to be specified");
+        return NGX_ERROR;
+    }
+
+    if (ucscf->ssl_verify) {
+
+        if (ucscf->ssl_name.len == 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "\"check_https_verify\" requires "
+                               "\"check_https_sni\" to be specified");
+            return NGX_ERROR;
+        }
+
+        if (ucscf->ssl_trusted_certificate.len == 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "\"check_https_verify\" requires "
+                               "\"check_https_trusted_certificate\" to be "
+                               "specified");
+            return NGX_ERROR;
+        }
+
+        if (ngx_ssl_trusted_certificate(cf, ssl,
+                                        &ucscf->ssl_trusted_certificate, 1)
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+
+        SSL_CTX_set_verify(ssl->ctx, SSL_VERIFY_PEER,
+                           ngx_http_upstream_check_ssl_verify_callback);
+    }
+
+    ucscf->ssl = ssl;
+
+    return NGX_OK;
+}
+
+
+#endif
+
+
 static ngx_int_t
 ngx_http_upstream_check_mysql_init(ngx_http_upstream_check_peer_t *peer)
 {
@@ -2885,6 +3321,14 @@ ngx_http_upstream_check_clean_event(ngx_http_upstream_check_peer_t *peer)
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
                        "http check clean event: index:%i, fd: %d",
                        peer->index, c->fd);
+
+#if (NGX_SSL)
+        /* a TLS connection with no finished handshake cannot be reused */
+        if (c->ssl != NULL && !c->ssl->handshaked) {
+            c->error = 1;
+        }
+#endif
+
         if (c->error == 0 &&
             cf->need_keepalive &&
             (c->requests < ucscf->check_keepalive_requests))
@@ -2892,6 +3336,9 @@ ngx_http_upstream_check_clean_event(ngx_http_upstream_check_peer_t *peer)
             c->write->handler = ngx_http_upstream_check_dummy_handler;
             c->read->handler = ngx_http_upstream_check_discard_handler;
         } else {
+#if (NGX_SSL)
+            ngx_http_upstream_check_ssl_close(c);
+#endif
             ngx_close_connection(c);
             peer->pc.connection = NULL;
         }
@@ -2987,6 +3434,9 @@ ngx_http_upstream_check_clear_all_events()
 
         c = peer[i].pc.connection;
         if (c) {
+#if (NGX_SSL)
+            ngx_http_upstream_check_ssl_close(c);
+#endif
             ngx_close_connection(c);
             peer[i].pc.connection = NULL;
         }
@@ -3588,6 +4038,248 @@ ngx_http_upstream_check_http_send(ngx_conf_t *cf, ngx_command_t *cmd,
 
 
 static char *
+ngx_http_upstream_check_https_sni(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+#if (NGX_SSL)
+
+    ngx_str_t                           *value;
+    ngx_http_upstream_check_srv_conf_t  *ucscf;
+
+    value = cf->args->elts;
+
+    ucscf = ngx_http_conf_get_module_srv_conf(cf,
+                                              ngx_http_upstream_check_module);
+
+    if (ucscf->ssl_name.len) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "duplicate \"check_https_sni\" directive");
+        return NGX_CONF_ERROR;
+    }
+
+    if (ngx_strlchr(value[1].data, value[1].data + value[1].len, '\0')) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid value for \"check_https_sni\", "
+                           "it must not contain null characters");
+        return NGX_CONF_ERROR;
+    }
+
+    ucscf->ssl_name = value[1];
+
+    return NGX_CONF_OK;
+
+#else
+
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "the \"check_https_sni\" directive requires nginx "
+                       "built with OpenSSL support "
+                       "(--with-http_ssl_module)");
+    return NGX_CONF_ERROR;
+
+#endif
+}
+
+
+static char *
+ngx_http_upstream_check_https_verify(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+#if (NGX_SSL)
+
+    ngx_str_t                           *value;
+    ngx_http_upstream_check_srv_conf_t  *ucscf;
+
+    value = cf->args->elts;
+
+    ucscf = ngx_http_conf_get_module_srv_conf(cf,
+                                              ngx_http_upstream_check_module);
+
+    if (ngx_strcmp(value[1].data, "on") == 0) {
+        ucscf->ssl_verify = 1;
+
+    } else if (ngx_strcmp(value[1].data, "off") == 0) {
+        ucscf->ssl_verify = 0;
+
+    } else {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid value \"%V\" for \"check_https_verify\", "
+                           "it must be \"on\" or \"off\"", &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+
+#else
+
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "the \"check_https_verify\" directive requires nginx "
+                       "built with OpenSSL support "
+                       "(--with-http_ssl_module)");
+    return NGX_CONF_ERROR;
+
+#endif
+}
+
+
+static char *
+ngx_http_upstream_check_https_trusted_certificate(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf)
+{
+#if (NGX_SSL)
+
+    ngx_str_t                           *value;
+    ngx_http_upstream_check_srv_conf_t  *ucscf;
+
+    value = cf->args->elts;
+
+    ucscf = ngx_http_conf_get_module_srv_conf(cf,
+                                              ngx_http_upstream_check_module);
+
+    if (ucscf->ssl_trusted_certificate.len) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "duplicate \"check_https_trusted_certificate\" "
+                           "directive");
+        return NGX_CONF_ERROR;
+    }
+
+    ucscf->ssl_trusted_certificate = value[1];
+
+    return NGX_CONF_OK;
+
+#else
+
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "the \"check_https_trusted_certificate\" directive "
+                       "requires nginx built with OpenSSL support "
+                       "(--with-http_ssl_module)");
+    return NGX_CONF_ERROR;
+
+#endif
+}
+
+
+/*
+ * mTLS: the certificate the check offers when the backend asks for one.
+ * These follow proxy_ssl_certificate, proxy_ssl_certificate_key and
+ * proxy_ssl_password_file, which the check has no way to reuse: they live
+ * in the proxy location configuration while the check runs from the
+ * upstream block.
+ */
+
+static char *
+ngx_http_upstream_check_https_certificate(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+#if (NGX_SSL)
+
+    ngx_str_t                           *value;
+    ngx_http_upstream_check_srv_conf_t  *ucscf;
+
+    value = cf->args->elts;
+
+    ucscf = ngx_http_conf_get_module_srv_conf(cf,
+                                              ngx_http_upstream_check_module);
+
+    if (ucscf->ssl_certificate.len) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "duplicate \"check_https_certificate\" directive");
+        return NGX_CONF_ERROR;
+    }
+
+    ucscf->ssl_certificate = value[1];
+
+    return NGX_CONF_OK;
+
+#else
+
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "the \"check_https_certificate\" directive requires "
+                       "nginx built with OpenSSL support "
+                       "(--with-http_ssl_module)");
+    return NGX_CONF_ERROR;
+
+#endif
+}
+
+
+static char *
+ngx_http_upstream_check_https_certificate_key(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf)
+{
+#if (NGX_SSL)
+
+    ngx_str_t                           *value;
+    ngx_http_upstream_check_srv_conf_t  *ucscf;
+
+    value = cf->args->elts;
+
+    ucscf = ngx_http_conf_get_module_srv_conf(cf,
+                                              ngx_http_upstream_check_module);
+
+    if (ucscf->ssl_certificate_key.len) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "duplicate \"check_https_certificate_key\" "
+                           "directive");
+        return NGX_CONF_ERROR;
+    }
+
+    ucscf->ssl_certificate_key = value[1];
+
+    return NGX_CONF_OK;
+
+#else
+
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "the \"check_https_certificate_key\" directive "
+                       "requires nginx built with OpenSSL support "
+                       "(--with-http_ssl_module)");
+    return NGX_CONF_ERROR;
+
+#endif
+}
+
+
+static char *
+ngx_http_upstream_check_https_password_file(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+#if (NGX_SSL)
+
+    ngx_str_t                           *value;
+    ngx_http_upstream_check_srv_conf_t  *ucscf;
+
+    value = cf->args->elts;
+
+    ucscf = ngx_http_conf_get_module_srv_conf(cf,
+                                              ngx_http_upstream_check_module);
+
+    if (ucscf->ssl_passwords != NULL) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "duplicate \"check_https_password_file\" "
+                           "directive");
+        return NGX_CONF_ERROR;
+    }
+
+    ucscf->ssl_passwords = ngx_ssl_read_password_file(cf, &value[1]);
+    if (ucscf->ssl_passwords == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+
+#else
+
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "the \"check_https_password_file\" directive requires "
+                       "nginx built with OpenSSL support "
+                       "(--with-http_ssl_module)");
+    return NGX_CONF_ERROR;
+
+#endif
+}
+
+
+static char *
 ngx_http_upstream_check_fastcgi_params(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf)
 {
@@ -3967,6 +4659,10 @@ ngx_http_upstream_check_create_srv_conf(ngx_conf_t *cf)
     ucscf->check_type_conf = NGX_CONF_UNSET_PTR;
     ucscf->resolve_max_addrs = NGX_CONF_UNSET_UINT;
 
+#if (NGX_SSL)
+    ucscf->ssl_verify = NGX_CONF_UNSET;
+#endif
+
     return ucscf;
 }
 
@@ -4036,7 +4732,50 @@ ngx_http_upstream_check_init_srv_conf(ngx_conf_t *cf, void *conf)
 
     check = ucscf->check_type_conf;
 
+#if (NGX_SSL)
+    /*
+     * A check_https_* directive in an upstream that is not checked over TLS
+     * has nothing to apply to: there is no handshake to configure.  Saying so
+     * beats accepting it quietly, which is how a client certificate that is
+     * never sent looks exactly like one that works.
+     */
+    if ((check == NULL || !check->need_ssl)
+        && (ucscf->ssl_name.len
+            || ucscf->ssl_trusted_certificate.len
+            || ucscf->ssl_certificate.len
+            || ucscf->ssl_certificate_key.len
+            || ucscf->ssl_passwords
+            || (ucscf->ssl_verify != NGX_CONF_UNSET && ucscf->ssl_verify)))
+    {
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                           "the \"check_https_*\" directives in upstream "
+                           "\"%V\" have no effect without \"check "
+                           "type=https\", they are ignored", &us->host);
+    }
+#endif
+
     if (check) {
+
+#if (NGX_SSL)
+        if (ucscf->ssl_verify == NGX_CONF_UNSET) {
+            ucscf->ssl_verify = 0;
+        }
+
+        if (check->need_ssl
+            && ngx_http_upstream_check_init_ssl(cf, ucscf) != NGX_OK)
+        {
+            return NGX_CONF_ERROR;
+        }
+
+#else
+        if (check->need_ssl) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "check type=https requires nginx built with "
+                               "OpenSSL support (--with-http_ssl_module)");
+            return NGX_CONF_ERROR;
+        }
+#endif
+
         if (ucscf->send.len == 0) {
             ngx_str_set(&s, "fastcgi");
 

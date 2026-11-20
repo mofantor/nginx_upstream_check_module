@@ -20,6 +20,22 @@ Synopsis
             #check_http_expect_alive http_2xx http_3xx;
         }
 
+        upstream secure_cluster {
+
+            server 192.168.0.1:443;
+            server 192.168.0.2:443;
+
+            check interval=3000 rise=2 fall=3 timeout=2000 type=https;
+            check_http_send "HEAD /health HTTP/1.0\r\nHost: www.example.com\r\n\r\n";
+            check_http_expect_alive http_2xx http_3xx;
+
+            check_https_sni www.example.com;
+            #check_https_verify on;
+            #check_https_trusted_certificate /etc/nginx/ca/BACKEND_CA.crt;
+            #check_https_certificate     /etc/nginx/certs/healthcheck.crt;
+            #check_https_certificate_key /etc/nginx/certs/healthcheck.key;
+        }
+
         server {
             listen 80;
 
@@ -45,7 +61,7 @@ Directives
   check
     syntax: *check interval=milliseconds [fall=count] [rise=count]
     [timeout=milliseconds] [default_down=true|false]
-    [type=tcp|http|ssl_hello|mysql|ajp|fastcgi]*
+    [type=tcp|http|https|ssl_hello|mysql|ajp|fastcgi]*
 
     default: *none, if parameters omitted, default parameters are
     interval=30000 fall=5 rise=2 timeout=1000 default_down=true type=tcp*
@@ -83,13 +99,21 @@ Directives
         3.  *http* sends a http request packet, receives and parses the http
             response to diagnose if the upstream server is alive.
 
-        4.  *mysql* connects to the mysql server, receives the greeting
+        4.  *https* opens a TLS connection to the backend and then does the
+            *http* check over it, with the same status code rules. The TLS
+            part is configured by *check_https_sni*, *check_https_verify*,
+            *check_https_trusted_certificate* and, for a backend that asks
+            the client for a certificate, *check_https_certificate*.
+            It needs nginx to be built with OpenSSL support, usually
+            --with-http_ssl_module.
+
+        5.  *mysql* connects to the mysql server, receives the greeting
             response to diagnose if the upstream server is alive.
 
-        5.  *ajp* sends a AJP Cping packet, receives and parses the AJP
+        6.  *ajp* sends a AJP Cping packet, receives and parses the AJP
             Cpong response to diagnose if the upstream server is alive.
 
-        6.  *fastcgi* send a fastcgi request, receives and parses the
+        7.  *fastcgi* send a fastcgi request, receives and parses the
             fastcgi response to diagnose if the upstream server is alive.
 
   check_http_send
@@ -113,6 +137,91 @@ Directives
     description: These status codes indicate the upstream server's http
     response is ok, the backend is alive.
 
+  check_https_sni
+    syntax: *check_https_sni name*
+
+    default: *none*
+
+    context: *upstream*
+
+    description: The name sent as the TLS server name indication, and the
+    name the backend certificate is matched against when *check_https_verify*
+    is on. Only used by *check type=https*.
+
+  check_https_verify
+    syntax: *check_https_verify on | off*
+
+    default: *off*
+
+    context: *upstream*
+
+    description: Verifies the backend certificate against the CA named by
+    *check_https_trusted_certificate* and the host name against
+    *check_https_sni*; a check that fails verification counts as a failure.
+    Both of those directives are required when this one is on. It is off by
+    default because health checks usually address a backend by address, and
+    the certificate there rarely matches that address.
+
+  check_https_trusted_certificate
+    syntax: *check_https_trusted_certificate file*
+
+    default: *none*
+
+    context: *upstream*
+
+    description: The CA certificate file used by *check_https_verify*.
+    Relative paths are resolved against the nginx prefix.
+
+  check_https_certificate
+    syntax: *check_https_certificate file*
+
+    default: *none*
+
+    context: *upstream*
+
+    description: The client certificate offered to the backend when the TLS
+    handshake asks for one, that is, a backend configured with
+    *ssl_verify_client on*. The file holds the certificate and its chain in
+    PEM, exactly like *proxy_ssl_certificate*. With
+    *check_https_certificate_key* it is what makes *check type=https* work
+    against a backend that requires a client certificate (mTLS). Relative
+    paths are resolved against the nginx prefix.
+
+    note: A backend that does not ask for a certificate ignores it, so one
+    pair of files can be configured for a mixed set of backends. It is loaded
+    once, into the TLS context of the upstream, not per check.
+
+  check_https_certificate_key
+    syntax: *check_https_certificate_key file*
+
+    default: *none*
+
+    context: *upstream*
+
+    description: The private key of *check_https_certificate*. It is required
+    as soon as a certificate is given, and it is refused at configuration
+    time when the certificate is missing. For an encrypted key see
+    *check_https_password_file*.
+
+    note: A check whose certificate the backend will not accept fails at a
+    different point per TLS version: TLSv1.2 never gets through the handshake,
+    TLSv1.3 finishes it and then answers the check request with an error
+    status. Either way the peer is reported down; the error log says *https
+    handshake error* or *check protocol https error*.
+
+  check_https_password_file
+    syntax: *check_https_password_file file*
+
+    default: *none*
+
+    context: *upstream*
+
+    description: A file of pass phrases, one per line, tried in order when
+    decrypting *check_https_certificate_key*, in the format of
+    *ssl_password_file* and *proxy_ssl_password_file*. Without it an
+    encrypted key is a configuration error, because a health check runs
+    unattended and there is nobody to type the phrase.
+
   check_keepalive_requests
     syntax: *check_keepalive_requests num*
 
@@ -123,6 +232,11 @@ Directives
     description: The directive specifies the number of requests sent on a
     connection, the default vaule 1 indicates that nginx will certainly
     close the connection after a request.
+
+    note: Values above 1 do not currently send more than one request per
+    connection: a check parks its connection when it finishes and the next
+    check closes that connection before connecting again.  *type=http* and
+    *type=https* behave the same way.
 
   check_fastcgi_param
     Syntax: *check_fastcgi_params parameter value*
