@@ -264,6 +264,11 @@ struct ngx_http_upstream_check_srv_conf_s {
     /* SNI and the name the peer certificate is matched against */
     ngx_str_t                                ssl_name;
     ngx_str_t                                ssl_trusted_certificate;
+    /* mTLS: the client certificate offered to the backend, its key and the
+     * passphrases for an encrypted key */
+    ngx_str_t                                ssl_certificate;
+    ngx_str_t                                ssl_certificate_key;
+    ngx_array_t                             *ssl_passwords;
 #endif
 
     ngx_array_t                             *fastcgi_params;
@@ -491,6 +496,12 @@ static char *ngx_http_upstream_check_https_verify(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_upstream_check_https_trusted_certificate(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
+static char *ngx_http_upstream_check_https_certificate(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_http_upstream_check_https_certificate_key(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_http_upstream_check_https_password_file(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 
 static char *ngx_http_upstream_check_shm_size(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
@@ -594,6 +605,27 @@ static ngx_command_t  ngx_http_upstream_check_commands[] = {
     { ngx_string("check_https_trusted_certificate"),
       NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
       ngx_http_upstream_check_https_trusted_certificate,
+      0,
+      0,
+      NULL },
+
+    { ngx_string("check_https_certificate"),
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
+      ngx_http_upstream_check_https_certificate,
+      0,
+      0,
+      NULL },
+
+    { ngx_string("check_https_certificate_key"),
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
+      ngx_http_upstream_check_https_certificate_key,
+      0,
+      0,
+      NULL },
+
+    { ngx_string("check_https_password_file"),
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
+      ngx_http_upstream_check_https_password_file,
       0,
       0,
       NULL },
@@ -3031,6 +3063,39 @@ ngx_http_upstream_check_init_ssl(ngx_conf_t *cf,
         ucscf->ssl_name.data = p;
     }
 
+    if (ucscf->ssl_certificate.len) {
+
+        if (ucscf->ssl_certificate_key.len == 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "no \"check_https_certificate_key\" is defined "
+                               "for certificate \"%V\"",
+                               &ucscf->ssl_certificate);
+            return NGX_ERROR;
+        }
+
+        /*
+         * The key is read once, here, and stays inside the SSL_CTX: a check
+         * connection inherits it through ngx_ssl_create_connection().  The
+         * passphrases come from the temporary configuration pool and are
+         * zeroed when it goes away, which is fine because they are only
+         * needed to read the key now.
+         */
+        if (ngx_ssl_certificate(cf, ssl, &ucscf->ssl_certificate,
+                                &ucscf->ssl_certificate_key,
+                                ucscf->ssl_passwords)
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+
+    } else if (ucscf->ssl_certificate_key.len) {
+
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "\"check_https_certificate_key\" requires "
+                           "\"check_https_certificate\" to be specified");
+        return NGX_ERROR;
+    }
+
     if (ucscf->ssl_verify) {
 
         if (ucscf->ssl_name.len == 0) {
@@ -4093,6 +4158,127 @@ ngx_http_upstream_check_https_trusted_certificate(ngx_conf_t *cf,
 }
 
 
+/*
+ * mTLS: the certificate the check offers when the backend asks for one.
+ * These follow proxy_ssl_certificate, proxy_ssl_certificate_key and
+ * proxy_ssl_password_file, which the check has no way to reuse: they live
+ * in the proxy location configuration while the check runs from the
+ * upstream block.
+ */
+
+static char *
+ngx_http_upstream_check_https_certificate(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+#if (NGX_SSL)
+
+    ngx_str_t                           *value;
+    ngx_http_upstream_check_srv_conf_t  *ucscf;
+
+    value = cf->args->elts;
+
+    ucscf = ngx_http_conf_get_module_srv_conf(cf,
+                                              ngx_http_upstream_check_module);
+
+    if (ucscf->ssl_certificate.len) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "duplicate \"check_https_certificate\" directive");
+        return NGX_CONF_ERROR;
+    }
+
+    ucscf->ssl_certificate = value[1];
+
+    return NGX_CONF_OK;
+
+#else
+
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "the \"check_https_certificate\" directive requires "
+                       "nginx built with OpenSSL support "
+                       "(--with-http_ssl_module)");
+    return NGX_CONF_ERROR;
+
+#endif
+}
+
+
+static char *
+ngx_http_upstream_check_https_certificate_key(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf)
+{
+#if (NGX_SSL)
+
+    ngx_str_t                           *value;
+    ngx_http_upstream_check_srv_conf_t  *ucscf;
+
+    value = cf->args->elts;
+
+    ucscf = ngx_http_conf_get_module_srv_conf(cf,
+                                              ngx_http_upstream_check_module);
+
+    if (ucscf->ssl_certificate_key.len) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "duplicate \"check_https_certificate_key\" "
+                           "directive");
+        return NGX_CONF_ERROR;
+    }
+
+    ucscf->ssl_certificate_key = value[1];
+
+    return NGX_CONF_OK;
+
+#else
+
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "the \"check_https_certificate_key\" directive "
+                       "requires nginx built with OpenSSL support "
+                       "(--with-http_ssl_module)");
+    return NGX_CONF_ERROR;
+
+#endif
+}
+
+
+static char *
+ngx_http_upstream_check_https_password_file(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+#if (NGX_SSL)
+
+    ngx_str_t                           *value;
+    ngx_http_upstream_check_srv_conf_t  *ucscf;
+
+    value = cf->args->elts;
+
+    ucscf = ngx_http_conf_get_module_srv_conf(cf,
+                                              ngx_http_upstream_check_module);
+
+    if (ucscf->ssl_passwords != NULL) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "duplicate \"check_https_password_file\" "
+                           "directive");
+        return NGX_CONF_ERROR;
+    }
+
+    ucscf->ssl_passwords = ngx_ssl_read_password_file(cf, &value[1]);
+    if (ucscf->ssl_passwords == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+
+#else
+
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "the \"check_https_password_file\" directive requires "
+                       "nginx built with OpenSSL support "
+                       "(--with-http_ssl_module)");
+    return NGX_CONF_ERROR;
+
+#endif
+}
+
+
 static char *
 ngx_http_upstream_check_fastcgi_params(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf)
@@ -4545,6 +4731,28 @@ ngx_http_upstream_check_init_srv_conf(ngx_conf_t *cf, void *conf)
     }
 
     check = ucscf->check_type_conf;
+
+#if (NGX_SSL)
+    /*
+     * A check_https_* directive in an upstream that is not checked over TLS
+     * has nothing to apply to: there is no handshake to configure.  Saying so
+     * beats accepting it quietly, which is how a client certificate that is
+     * never sent looks exactly like one that works.
+     */
+    if ((check == NULL || !check->need_ssl)
+        && (ucscf->ssl_name.len
+            || ucscf->ssl_trusted_certificate.len
+            || ucscf->ssl_certificate.len
+            || ucscf->ssl_certificate_key.len
+            || ucscf->ssl_passwords
+            || (ucscf->ssl_verify != NGX_CONF_UNSET && ucscf->ssl_verify)))
+    {
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                           "the \"check_https_*\" directives in upstream "
+                           "\"%V\" have no effect without \"check "
+                           "type=https\", they are ignored", &us->host);
+    }
+#endif
 
     if (check) {
 

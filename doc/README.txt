@@ -32,6 +32,8 @@ Synopsis
             check_https_sni www.example.com;
             #check_https_verify on;
             #check_https_trusted_certificate /etc/nginx/ca/BACKEND_CA.crt;
+            #check_https_certificate     /etc/nginx/certs/healthcheck.crt;
+            #check_https_certificate_key /etc/nginx/certs/healthcheck.key;
         }
 
         server {
@@ -99,9 +101,11 @@ Directives
 
         4.  *https* opens a TLS connection to the backend and then does the
             *http* check over it, with the same status code rules. The TLS
-            part is configured by *check_https_sni*, *check_https_verify* and
-            *check_https_trusted_certificate*. It needs nginx to be built
-            with OpenSSL support, usually --with-http_ssl_module.
+            part is configured by *check_https_sni*, *check_https_verify*,
+            *check_https_trusted_certificate* and, for a backend that asks
+            the client for a certificate, *check_https_certificate*.
+            It needs nginx to be built with OpenSSL support, usually
+            --with-http_ssl_module.
 
         5.  *mysql* connects to the mysql server, receives the greeting
             response to diagnose if the upstream server is alive.
@@ -167,6 +171,56 @@ Directives
 
     description: The CA certificate file used by *check_https_verify*.
     Relative paths are resolved against the nginx prefix.
+
+  check_https_certificate
+    syntax: *check_https_certificate file*
+
+    default: *none*
+
+    context: *upstream*
+
+    description: The client certificate offered to the backend when the TLS
+    handshake asks for one, that is, a backend configured with
+    *ssl_verify_client on*. The file holds the certificate and its chain in
+    PEM, exactly like *proxy_ssl_certificate*. With
+    *check_https_certificate_key* it is what makes *check type=https* work
+    against a backend that requires a client certificate (mTLS). Relative
+    paths are resolved against the nginx prefix.
+
+    note: A backend that does not ask for a certificate ignores it, so one
+    pair of files can be configured for a mixed set of backends. It is loaded
+    once, into the TLS context of the upstream, not per check.
+
+  check_https_certificate_key
+    syntax: *check_https_certificate_key file*
+
+    default: *none*
+
+    context: *upstream*
+
+    description: The private key of *check_https_certificate*. It is required
+    as soon as a certificate is given, and it is refused at configuration
+    time when the certificate is missing. For an encrypted key see
+    *check_https_password_file*.
+
+    note: A check whose certificate the backend will not accept fails at a
+    different point per TLS version: TLSv1.2 never gets through the handshake,
+    TLSv1.3 finishes it and then answers the check request with an error
+    status. Either way the peer is reported down; the error log says *https
+    handshake error* or *check protocol https error*.
+
+  check_https_password_file
+    syntax: *check_https_password_file file*
+
+    default: *none*
+
+    context: *upstream*
+
+    description: A file of pass phrases, one per line, tried in order when
+    decrypting *check_https_certificate_key*, in the format of
+    *ssl_password_file* and *proxy_ssl_password_file*. Without it an
+    encrypted key is a configuration error, because a health check runs
+    unattended and there is nobody to type the phrase.
 
   check_keepalive_requests
     syntax: *check_keepalive_requests num*

@@ -25,6 +25,7 @@ BASE_PORT=${BASE_PORT:-18500}
 TLS_PORT=$((BASE_PORT))        # the backend, TLS
 PLAIN_PORT=$((BASE_PORT + 1))  # the backend, plain HTTP and a black hole hole
 SLOW_PORT=$((BASE_PORT + 2))   # accepts, never answers the handshake
+MTLS_PORT=$((BASE_PORT + 3))   # the backend, TLS that wants a client certificate
 STATUS_PORT=$BASE_PORT
 
 PASS=0; FAIL=0; NPORT=$((BASE_PORT + 100))
@@ -71,7 +72,21 @@ mkdir -p "$D/logs" "$D/tmp" "$D/certs"
  openssl x509 -req -in srv.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
         -out srv.crt -days 2 -extfile srv.ext 2>/dev/null &&
  openssl req -x509 -newkey rsa:2048 -keyout other-ca.key -out other-ca.crt \
-        -days 2 -nodes -subj "/CN=another CA" 2>/dev/null) \
+        -days 2 -nodes -subj "/CN=another CA" 2>/dev/null &&
+
+ # client certificates: one the backend accepts, one it does not, and the
+ # first one again behind a passphrase
+ openssl req -newkey rsa:2048 -keyout cli.key -out cli.csr -nodes \
+        -subj "/CN=check client" 2>/dev/null &&
+ openssl x509 -req -in cli.csr -CA ca.crt -CAkey ca.key -CAserial ca.srl \
+        -out cli.crt -days 2 2>/dev/null &&
+ openssl req -newkey rsa:2048 -keyout other-cli.key -out other-cli.csr -nodes \
+        -subj "/CN=client of another CA" 2>/dev/null &&
+ openssl x509 -req -in other-cli.csr -CA other-ca.crt -CAkey other-ca.key \
+        -CAcreateserial -out other-cli.crt -days 2 2>/dev/null &&
+ openssl pkcs8 -topk8 -in cli.key -out cli-enc.key -passout pass:s3cret \
+        2>/dev/null &&
+ printf 's3cret\n' > passwords.txt) \
     || { echo "could not create the test certificates"; exit 1; }
 
 tempaths() {
@@ -98,6 +113,16 @@ $(tempaths)
         ssl_certificate_key $D/certs/srv.key;
         location /ok   { return 200 "ok\n"; }
         location /fail { return 500 "no\n"; }
+    }
+    server {
+        listen 127.0.0.1:$MTLS_PORT ssl;
+        http2 off;
+        ssl_certificate     $D/certs/srv.crt;
+        ssl_certificate_key $D/certs/srv.key;
+        ssl_verify_client    on;
+        ssl_client_certificate $D/certs/ca.crt;
+        location /ok   { return 200 "mtls ok\n"; }
+        location /fail { return 500 "mtls no\n"; }
     }
     server {
         listen 127.0.0.1:$PLAIN_PORT;
@@ -148,7 +173,9 @@ $body
     }
 }
 EOF
-    if ! "$NGINX_BIN" -c "$D/front.conf" -t \
+    # stdin is not a terminal here: an encrypted key with no password file
+    # makes OpenSSL's own prompt fail instead of waiting for a typed phrase
+    if ! "$NGINX_BIN" -c "$D/front.conf" -t < /dev/null \
             > "$D/logs/conftest-$file.log" 2>&1; then
         if [ "${QUIET:-0}" = 0 ]; then
             echo "    configuration rejected:"
@@ -271,6 +298,75 @@ $SEND
         check_https_trusted_certificate $D/certs/other-ca.crt;
 EOF
 
+# mTLS: the backend demands a certificate from every client. A check that
+# cannot answer that request fails one way over TLSv1.2 (the handshake is
+# refused) and another way over TLSv1.3 (the handshake completes and the
+# request comes back with an error status), so these cases only assert the
+# answer the status page gives
+run "mtls, client cert offered" up 8 <<EOF
+        server 127.0.0.1:$MTLS_PORT;
+        check interval=500 rise=1 fall=2 timeout=2000 type=https;
+$SEND
+        check_https_sni localhost;
+        check_https_certificate $D/certs/cli.crt;
+        check_https_certificate_key $D/certs/cli.key;
+EOF
+
+run "mtls, no client cert" down 8 <<EOF
+        server 127.0.0.1:$MTLS_PORT;
+        check interval=500 rise=1 fall=2 timeout=2000 default_down=false type=https;
+$SEND
+        check_https_sni localhost;
+EOF
+
+run "mtls, cert of another CA" down 8 <<EOF
+        server 127.0.0.1:$MTLS_PORT;
+        check interval=500 rise=1 fall=2 timeout=2000 default_down=false type=https;
+$SEND
+        check_https_sni localhost;
+        check_https_certificate $D/certs/other-cli.crt;
+        check_https_certificate_key $D/certs/other-cli.key;
+EOF
+
+run "mtls, encrypted key, password file" up 8 <<EOF
+        server 127.0.0.1:$MTLS_PORT;
+        check interval=500 rise=1 fall=2 timeout=2000 type=https;
+$SEND
+        check_https_sni localhost;
+        check_https_certificate $D/certs/cli.crt;
+        check_https_certificate_key $D/certs/cli-enc.key;
+        check_https_password_file $D/certs/passwords.txt;
+EOF
+
+run "mtls and verify on" up 8 <<EOF
+        server 127.0.0.1:$MTLS_PORT;
+        check interval=500 rise=1 fall=2 timeout=2000 type=https;
+$SEND
+        check_https_verify on;
+        check_https_sni localhost;
+        check_https_trusted_certificate $D/certs/ca.crt;
+        check_https_certificate $D/certs/cli.crt;
+        check_https_certificate_key $D/certs/cli.key;
+EOF
+
+run "mtls peer, 500 is still a failure" down 8 <<EOF
+        server 127.0.0.1:$MTLS_PORT;
+        check interval=500 rise=1 fall=2 timeout=2000 default_down=false type=https;
+        check_http_send "GET /fail HTTP/1.0\r\n\r\n";
+        check_http_expect_alive http_2xx;
+        check_https_sni localhost;
+        check_https_certificate $D/certs/cli.crt;
+        check_https_certificate_key $D/certs/cli.key;
+EOF
+
+run "plain tls peer, mtls off" up 6 <<EOF
+        server 127.0.0.1:$TLS_PORT;
+        check interval=500 rise=1 fall=2 timeout=2000 type=https;
+$SEND
+        check_https_certificate $D/certs/cli.crt;
+        check_https_certificate_key $D/certs/cli.key;
+EOF
+
 run "type=http still works" up 6 <<EOF
         server 127.0.0.1:$PLAIN_PORT;
         check interval=500 rise=1 fall=2 timeout=2000 type=http;
@@ -300,7 +396,12 @@ front_stop "reappear"
 echo "== configuration errors"
 for bad in "check_https_verify on;" \
            "check_https_verify on; check_https_sni localhost;" \
-           "check interval=1000 type=httpsx;"
+           "check interval=1000 type=httpsx;" \
+           "check_https_certificate $D/certs/cli.crt;" \
+           "check_https_certificate_key $D/certs/cli.key;" \
+           "check_https_certificate $D/certs/cli.crt; check_https_certificate_key $D/certs/missing.key;" \
+           "check_https_certificate $D/certs/cli.crt; check_https_certificate_key $D/certs/cli-enc.key;" \
+           "check_https_password_file $D/certs/missing.txt;"
 do
     printf '   %-58s ' "$bad"
     QUIET=1
@@ -317,6 +418,38 @@ EOF
         grep -m1 -oE "\[emerg\].*" "$D/logs/conftest-rejected_case.log" \
             | cut -c1-104
         PASS=$((PASS + 1))
+    fi
+    QUIET=0
+done
+
+# A check_https_* directive in an upstream that is not checked over TLS has
+# nothing to apply to.  It has to be refused or reported, never ignored.
+echo "== check_https_* with a check type that is not https"
+for pair in "type=http|check_https_certificate $D/certs/cli.crt;" \
+            "type=tcp|check_https_certificate_key $D/certs/cli.key;" \
+            "type=http|check_https_verify on;"
+do
+    type=${pair%%|*}; bad=${pair#*|}
+    printf '   %-58s ' "$type + ${bad%% *}"
+    QUIET=1
+    if front_start "warned case" <<EOF
+        server 127.0.0.1:$PLAIN_PORT;
+        check interval=500 rise=1 fall=2 timeout=2000 $type;
+        $bad
+EOF
+    then
+        if grep -q "check_https_\*.*ignored" "$D/logs/conftest-warned_case.log"; then
+            grep -m1 -oE "the \"check_https_\*\" directives.*" \
+                "$D/logs/conftest-warned_case.log" | cut -c1-104
+            PASS=$((PASS + 1))
+        else
+            echo "accepted quietly, no warning"
+            FAIL=$((FAIL + 1))
+        fi
+        front_stop "warned case"
+    else
+        echo "rejected, that is wrong"
+        FAIL=$((FAIL + 1))
     fi
     QUIET=0
 done
