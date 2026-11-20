@@ -1718,7 +1718,7 @@ ngx_http_upstream_check_recv_handler(ngx_event_t *event)
 
     if (ctx->recv.start == NULL) {
         /* 1/2 of the page_size, is it enough? */
-        ctx->recv.start = ngx_palloc(c->pool, ngx_pagesize / 2);
+        ctx->recv.start = ngx_palloc(peer->pool, ngx_pagesize / 2);
         if (ctx->recv.start == NULL) {
             goto check_recv_fail;
         }
@@ -1733,7 +1733,7 @@ ngx_http_upstream_check_recv_handler(ngx_event_t *event)
         /* buffer not big enough? enlarge it by twice */
         if (n == 0) {
             size = ctx->recv.end - ctx->recv.start;
-            new_buf = ngx_palloc(c->pool, size * 2);
+            new_buf = ngx_palloc(peer->pool, size * 2);
             if (new_buf == NULL) {
                 goto check_recv_fail;
             }
