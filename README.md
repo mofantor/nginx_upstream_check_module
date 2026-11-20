@@ -20,6 +20,21 @@ support upstream health check with Nginx
             #check_http_expect_alive http_2xx http_3xx;
         }
 
+        # HTTPS backend: a real TLS connection, then the HTTP check over it
+        upstream secure_cluster {
+
+            server 192.168.0.1:443;
+            server 192.168.0.2:443;
+
+            check interval=3000 rise=2 fall=3 timeout=2000 type=https;
+            check_http_send "HEAD /health HTTP/1.0\r\nHost: www.example.com\r\n\r\n";
+            check_http_expect_alive http_2xx http_3xx;
+
+            check_https_sni www.example.com;
+            # check_https_verify on;
+            # check_https_trusted_certificate /etc/nginx/ca/BACKEND_CA.crt;
+        }
+
         # Dynamic DNS upstream (nginx 1.27.3+, zone + resolve)
         upstream dynamic_cluster {
             zone dynamic_cluster 512k;
@@ -59,7 +74,7 @@ Add the support of health check with the upstream servers.
 ## Directives
 ### check
 + syntax
-> check interval=milliseconds [fall=count] [rise=count] [timeout=milliseconds] [default_down=true|false] [type=tcp|http|ssl_hello|mysql|ajp|fastcgi]
+> check interval=milliseconds [fall=count] [rise=count] [timeout=milliseconds] [default_down=true|false] [type=tcp|http|https|ssl_hello|mysql|ajp|fastcgi]
 
 + default: 
 > *none, if parameters omitted, default parameters are interval=30000 fall=5 rise=2 timeout=1000 default_down=true type=tcp*
@@ -88,6 +103,8 @@ Add the support of health check with the upstream servers.
     ​**ssl_hello**: Send SSL ClientHello and receive ServerHello.
 
     ​**http**: Send HTTP request and validate response.
+
+    ​**https**: Open a TLS connection to the backend, then send the HTTP request over it and validate the response. Same status code rules as type=http. Requires nginx to be built with OpenSSL support (--with-http_ssl_module); see check_https_sni, check_https_verify and check_https_trusted_certificate.
 
     ​**mysql**: Check MySQL server greeting.
 
@@ -123,6 +140,48 @@ Add the support of health check with the upstream servers.
 > HTTP status codes indicating a healthy server.
 
 
+### check_https_sni
++ Syntax:
+> check_https_sni name
+
++ Default:
+> none
+
++ Context:
+> upstream
+
++ Description:
+> Sends `name` as the TLS server name indication and uses it as the name the backend certificate is matched against when check_https_verify is on. Only used by `check type=https`.
+
+### check_https_verify
++ Syntax:
+> check_https_verify on|off
+
++ Default:
+> off
+
++ Context:
+> upstream
+
++ Description:
+> Verifies the backend certificate against the CA in check_https_trusted_certificate, and the host name against check_https_sni. A check that fails verification counts as a failure. Both check_https_sni and check_https_trusted_certificate are required when this is on.
+
++ Note:
+> Verification is off by default on purpose. Health checks usually talk to a backend by address, with a certificate that was not issued for that address.
+
+### check_https_trusted_certificate
++ Syntax:
+> check_https_trusted_certificate file
+
++ Default:
+> none
+
++ Context:
+> upstream
+
++ Description:
+> The CA certificate file used by check_https_verify. Relative paths are resolved against the nginx prefix.
+
 ### check_keepalive_requests
 + ​Syntax:
 > check_keepalive_requests num
@@ -135,7 +194,6 @@ Add the support of health check with the upstream servers.
 
 + ​Description:
 > Number of requests sent per keepalive connection.
-
 ### check_fastcgi_param
 + ​Syntax:
 > check_fastcgi_params parameter value
@@ -396,6 +454,26 @@ sudo make install
 > **Note:** `check_zone_1.30+.patch` is only needed when you use
 > `zone` + `server <hostname> resolve` upstreams.  It is safe to apply even
 > when you do not use dynamic DNS — it adds no overhead for static upstreams.
+
+> **Note:** `check type=https` needs nginx configured with OpenSSL, normally
+> `--with-http_ssl_module`.  The module still builds without it and every
+> other check type works; `check type=https` and the three `check_https_*`
+> directives are then refused at configuration time with a message naming the
+> missing module.
+
+## Tests
+`test/https_check.sh` covers `check type=https`.  It generates throwaway
+certificates, starts a TLS backend and a frontend whose upstream is checked
+over TLS, and reads `check_status` to assert that the peer goes up or down.
+The failure cases run with `default_down=false`, so a "down" answer can only
+come from a failed check.  It needs nginx(1) built with this module and with
+`--with-http_ssl_module --with-http_v2_module`, plus openssl(1), curl and
+python3.  The binary is named by `NGINX_BIN`, not `NGINX`: nginx itself reads
+`NGINX` from the environment.
+
+```bash
+NGINX_BIN=/path/to/nginx test/https_check.sh
+```
 
 ## Compatibility Notes
 | Nginx Version | Required Patch |

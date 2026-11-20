@@ -20,6 +20,20 @@ Synopsis
             #check_http_expect_alive http_2xx http_3xx;
         }
 
+        upstream secure_cluster {
+
+            server 192.168.0.1:443;
+            server 192.168.0.2:443;
+
+            check interval=3000 rise=2 fall=3 timeout=2000 type=https;
+            check_http_send "HEAD /health HTTP/1.0\r\nHost: www.example.com\r\n\r\n";
+            check_http_expect_alive http_2xx http_3xx;
+
+            check_https_sni www.example.com;
+            #check_https_verify on;
+            #check_https_trusted_certificate /etc/nginx/ca/BACKEND_CA.crt;
+        }
+
         server {
             listen 80;
 
@@ -45,7 +59,7 @@ Directives
   check
     syntax: *check interval=milliseconds [fall=count] [rise=count]
     [timeout=milliseconds] [default_down=true|false]
-    [type=tcp|http|ssl_hello|mysql|ajp|fastcgi]*
+    [type=tcp|http|https|ssl_hello|mysql|ajp|fastcgi]*
 
     default: *none, if parameters omitted, default parameters are
     interval=30000 fall=5 rise=2 timeout=1000 default_down=true type=tcp*
@@ -83,13 +97,19 @@ Directives
         3.  *http* sends a http request packet, receives and parses the http
             response to diagnose if the upstream server is alive.
 
-        4.  *mysql* connects to the mysql server, receives the greeting
+        4.  *https* opens a TLS connection to the backend and then does the
+            *http* check over it, with the same status code rules. The TLS
+            part is configured by *check_https_sni*, *check_https_verify* and
+            *check_https_trusted_certificate*. It needs nginx to be built
+            with OpenSSL support, usually --with-http_ssl_module.
+
+        5.  *mysql* connects to the mysql server, receives the greeting
             response to diagnose if the upstream server is alive.
 
-        5.  *ajp* sends a AJP Cping packet, receives and parses the AJP
+        6.  *ajp* sends a AJP Cping packet, receives and parses the AJP
             Cpong response to diagnose if the upstream server is alive.
 
-        6.  *fastcgi* send a fastcgi request, receives and parses the
+        7.  *fastcgi* send a fastcgi request, receives and parses the
             fastcgi response to diagnose if the upstream server is alive.
 
   check_http_send
@@ -112,6 +132,41 @@ Directives
 
     description: These status codes indicate the upstream server's http
     response is ok, the backend is alive.
+
+  check_https_sni
+    syntax: *check_https_sni name*
+
+    default: *none*
+
+    context: *upstream*
+
+    description: The name sent as the TLS server name indication, and the
+    name the backend certificate is matched against when *check_https_verify*
+    is on. Only used by *check type=https*.
+
+  check_https_verify
+    syntax: *check_https_verify on | off*
+
+    default: *off*
+
+    context: *upstream*
+
+    description: Verifies the backend certificate against the CA named by
+    *check_https_trusted_certificate* and the host name against
+    *check_https_sni*; a check that fails verification counts as a failure.
+    Both of those directives are required when this one is on. It is off by
+    default because health checks usually address a backend by address, and
+    the certificate there rarely matches that address.
+
+  check_https_trusted_certificate
+    syntax: *check_https_trusted_certificate file*
+
+    default: *none*
+
+    context: *upstream*
+
+    description: The CA certificate file used by *check_https_verify*.
+    Relative paths are resolved against the nginx prefix.
 
   check_keepalive_requests
     syntax: *check_keepalive_requests num*
